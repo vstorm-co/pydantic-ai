@@ -864,6 +864,182 @@ def test_usage_unknown_provider():
     assert RequestUsage.extract({}, provider='unknown', provider_url='', provider_fallback='') == RequestUsage()
 
 
+def test_check_cost_under_limit() -> None:
+    """Accumulated cost below the limit does not raise."""
+    limits = UsageLimits(cost_limit_usd=Decimal('1.00'))
+    usage = RunUsage(total_cost_usd=Decimal('0.50'))
+    limits.check_cost(usage)
+
+
+def test_check_cost_over_limit() -> None:
+    """Accumulated cost over the limit raises UsageLimitExceeded."""
+    limits = UsageLimits(cost_limit_usd=Decimal('1.00'))
+    usage = RunUsage(total_cost_usd=Decimal('1.50'))
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('Exceeded the cost_limit_usd of 1.00 (total_cost_usd=1.50)'),
+    ):
+        limits.check_cost(usage)
+
+
+def test_check_before_request_cost_at_limit() -> None:
+    """A run already at the cost limit cannot make another model request."""
+    limits = UsageLimits(cost_limit_usd=Decimal('1.00'))
+    usage = RunUsage(total_cost_usd=Decimal('1.00'))
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next request would exceed the cost_limit_usd of 1.00 (total_cost_usd=1.00)'),
+    ):
+        limits.check_before_request(usage)
+
+
+def test_cost_limit_usd_accepts_int_and_str() -> None:
+    """`cost_limit_usd` coerces `int` and `str` to `Decimal`."""
+    from_int = UsageLimits(cost_limit_usd=5)
+    from_str = UsageLimits(cost_limit_usd='5.00')
+    from_decimal = UsageLimits(cost_limit_usd=Decimal('5'))
+
+    assert from_int.cost_limit_usd == Decimal('5')
+    assert isinstance(from_int.cost_limit_usd, Decimal)
+    assert from_str.cost_limit_usd == Decimal('5.00')
+    assert from_decimal.cost_limit_usd == Decimal('5')
+
+
+def test_cost_limit_usd_rejects_bool() -> None:
+    """`bool` (an `int` subclass) is rejected rather than silently coerced to `Decimal('1')`."""
+    with pytest.raises(TypeError, match='does not accept bool'):
+        UsageLimits(cost_limit_usd=True)
+
+
+def test_cost_limit_usd_rejects_unparseable_string() -> None:
+    """A non-numeric string raises a clear `ValueError` instead of leaking `decimal.InvalidOperation`."""
+    with pytest.raises(ValueError, match='could not be parsed as a decimal number'):
+        UsageLimits(cost_limit_usd='5 dollars')
+
+
+def test_cost_limit_usd_rejects_float() -> None:
+    """`float` is rejected with `TypeError`."""
+    with pytest.raises(TypeError, match='does not accept float'):
+        UsageLimits(cost_limit_usd=5.0)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+
+def test_check_cost_no_limit_configured() -> None:
+    """Without `cost_limit_usd`, `check_cost` is a no-op."""
+    limits = UsageLimits()
+    usage = RunUsage(total_cost_usd=Decimal('999999.99'))
+    limits.check_cost(usage)
+
+
+def test_check_cost_poisoned_usage_fails_open() -> None:
+    """`check_cost` is no-op when `total_cost_usd` is poisoned."""
+    limits = UsageLimits(cost_limit_usd=Decimal('1.00'))
+    usage = RunUsage(total_cost_usd=None)
+    limits.check_cost(usage)
+
+
+def test_run_usage_incr_sums_costs() -> None:
+    """Cost accumulation across RunUsage instances sums correctly."""
+    a = RunUsage(total_cost_usd=Decimal('1.0'))
+    b = RunUsage(total_cost_usd=Decimal('2.5'))
+    a.incr(b)
+    assert a.total_cost_usd == Decimal('3.5')
+
+
+def test_run_usage_incr_poisons_on_unknown_cost() -> None:
+    """Incrementing with a poisoned (None) usage propagates poison stickily."""
+    a = RunUsage(total_cost_usd=Decimal('1.0'))
+    a.incr(RunUsage(total_cost_usd=None))
+    assert a.total_cost_usd is None
+    a.incr(RunUsage(total_cost_usd=Decimal('5.0')))
+    assert a.total_cost_usd is None
+
+
+async def test_cost_limit_exceeded_during_run() -> None:
+    """Agent run aborts when accumulated cost crosses `cost_limit_usd`."""
+
+    def make_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart('ok')],
+            usage=RequestUsage(input_tokens=500_000, output_tokens=100_000),
+        )
+
+    agent = Agent(FunctionModel(make_response, model_name='gpt-4o'))
+
+    with pytest.raises(UsageLimitExceeded, match=r'Exceeded the cost_limit_usd of 1\.00'):
+        await agent.run('hello', usage_limits=UsageLimits(cost_limit_usd=Decimal('1.00')))
+
+
+async def test_cost_accumulates_under_limit() -> None:
+    """`total_cost_usd` accumulates correctly when under the limit."""
+
+    def make_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart('ok')],
+            usage=RequestUsage(input_tokens=1_000, output_tokens=500),
+        )
+
+    agent = Agent(FunctionModel(make_response, model_name='gpt-4o'))
+    result = await agent.run('hello', usage_limits=UsageLimits(cost_limit_usd=Decimal('100.00')))
+
+    assert result.usage().total_cost_usd == snapshot(Decimal('0.0075'))
+
+
+async def test_cost_unknown_model_does_not_enforce_limit() -> None:
+    """Pricing unavailable → `total_cost_usd` poisoned and limit not enforced."""
+
+    def make_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart('ok')],
+            usage=RequestUsage(input_tokens=1_000_000, output_tokens=500_000),
+        )
+
+    agent = Agent(FunctionModel(make_response, model_name='totally-unknown-model-xyz'))
+    result = await agent.run('hello', usage_limits=UsageLimits(cost_limit_usd=Decimal('0.0001')))
+
+    assert result.usage().total_cost_usd is None
+
+
+async def test_cost_calculated_without_limit_configured() -> None:
+    """Without `cost_limit_usd`, `total_cost_usd` still reports observed spend."""
+
+    def make_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart('ok')],
+            usage=RequestUsage(input_tokens=1_000, output_tokens=500),
+        )
+
+    agent = Agent(FunctionModel(make_response, model_name='gpt-4o'))
+    result = await agent.run('hello')
+
+    assert result.usage().total_cost_usd == snapshot(Decimal('0.0075'))
+
+
+def test_cost_or_none_without_model_name() -> None:
+    """`cost_or_none` returns None (not AssertionError) when `model_name` is missing."""
+    response = ModelResponse(parts=[TextPart('ok')], usage=RequestUsage(input_tokens=10, output_tokens=5))
+    assert response.model_name is None
+    assert response.cost_or_none() is None
+
+
+def test_cost_or_none_without_usage() -> None:
+    """Zero-usage synthetic responses cost zero even without a model name."""
+    response = ModelResponse(parts=[TextPart('ok')])
+    assert response.model_name is None
+    assert response.cost_or_none() == Decimal(0)
+
+
+def test_cost_or_none_test_provider() -> None:
+    """The synthetic test provider is treated as zero-cost even when usage is non-zero."""
+    response = ModelResponse(
+        parts=[TextPart('ok')],
+        usage=RequestUsage(input_tokens=10, output_tokens=5),
+        model_name='test',
+        provider_name='test',
+    )
+    assert response.cost_or_none() == Decimal(0)
+
+
 def test_usage_limits_preserves_explicit_zero():
     """Test that explicit 0 token limits are preserved and not replaced by deprecated fallbacks."""
     # When input_tokens_limit=0 and deprecated request_tokens_limit is also set,

@@ -676,6 +676,33 @@ except UsageLimitExceeded as e:
     - Usage limits are especially relevant if you've registered many tools. Use `request_limit` to bound the number of model turns, and `tool_calls_limit` to cap the number of successful tool executions within a run.
     - The `tool_calls_limit` is checked before executing tool calls. If the model returns parallel tool calls that would exceed the limit, no tools will be executed.
 
+##### Capping cost in USD
+
+[`UsageLimits.cost_limit_usd`][pydantic_ai.usage.UsageLimits.cost_limit_usd] caps the cumulative cost of all model requests within a single run, blocking a new request once the run has reached the limit and checking again after each response. Costs are calculated from the response's token counts via [`genai-prices`][pydantic_ai.messages.ModelResponse.cost], so they reflect provider list prices for the model used (including different rates for input, output, and cache tokens).
+
+```py {test="skip"}
+from pydantic_ai import Agent, UsageLimitExceeded, UsageLimits
+
+agent = Agent('anthropic:claude-sonnet-4-6')
+
+try:
+    result = agent.run_sync(
+        'Summarise this long document...',
+        usage_limits=UsageLimits(cost_limit_usd='0.05'),
+    )
+except UsageLimitExceeded as e:
+    print(e)
+else:
+    print(result.usage().total_cost_usd)
+```
+
+`cost_limit_usd` accepts `int`, `str`, or [`Decimal`][decimal.Decimal] — internally normalised to `Decimal` so arithmetic stays exact. `float` is rejected with `TypeError` to prevent binary-float precision errors from creeping into budget tracking.
+
+The check is performed **after each response**, so a single request can overshoot the limit by its own cost — typically a few cents on top of a multi-dollar limit. For models whose pricing is not in `genai-prices` (for example, self-hosted models served via an OpenAI-compatible endpoint), [`RunUsage.total_cost_usd`][pydantic_ai.usage.RunUsage.total_cost_usd] is set to `None` (poisoned) and the limit is not enforced for the remainder of the run — fail-open to avoid silently breaking agent execution.
+
+!!! note "Cumulative budgets across runs"
+    `cost_limit_usd` is a per-run circuit breaker — each call to [`Agent.run`][pydantic_ai.agent.AbstractAgent.run] starts fresh at zero. To enforce a **cumulative** budget across many runs over a rolling time window (for example, "no more than \$100 per client per 24 hours"), use the [`BudgetGuard`][pydantic_ai.budget.BudgetGuard] capability — see [Budget tracking](budget.md).
+
 #### Model (Run) Settings
 
 Pydantic AI offers a [`settings.ModelSettings`][pydantic_ai.settings.ModelSettings] structure to help you fine tune your requests.
