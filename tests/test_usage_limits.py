@@ -1000,8 +1000,8 @@ async def test_cost_unknown_model_does_not_enforce_limit() -> None:
     assert result.usage().total_cost_usd is None
 
 
-async def test_cost_calculated_without_limit_configured() -> None:
-    """Without `cost_limit_usd`, `total_cost_usd` still reports observed spend."""
+async def test_cost_not_calculated_without_limit_configured() -> None:
+    """Without `cost_limit_usd`, cost tracking stays off so `RunUsage` is unchanged for existing runs."""
 
     def make_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         return ModelResponse(
@@ -1012,7 +1012,7 @@ async def test_cost_calculated_without_limit_configured() -> None:
     agent = Agent(FunctionModel(make_response, model_name='gpt-4o'))
     result = await agent.run('hello')
 
-    assert result.usage().total_cost_usd == snapshot(Decimal('0.0075'))
+    assert result.usage().total_cost_usd == Decimal(0)
 
 
 def test_cost_or_none_without_model_name() -> None:
@@ -1026,17 +1026,6 @@ def test_cost_or_none_without_usage() -> None:
     """Zero-usage synthetic responses cost zero even without a model name."""
     response = ModelResponse(parts=[TextPart('ok')])
     assert response.model_name is None
-    assert response.cost_or_none() == Decimal(0)
-
-
-def test_cost_or_none_test_provider() -> None:
-    """The synthetic test provider is treated as zero-cost even when usage is non-zero."""
-    response = ModelResponse(
-        parts=[TextPart('ok')],
-        usage=RequestUsage(input_tokens=10, output_tokens=5),
-        model_name='test',
-        provider_name='test',
-    )
     assert response.cost_or_none() == Decimal(0)
 
 

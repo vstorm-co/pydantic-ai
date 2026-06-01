@@ -916,13 +916,13 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         """Append a model response to history, updating usage and cost tracking."""
         response.run_id = response.run_id or ctx.state.run_id
         ctx.state.usage.incr(response.usage)
-        if ctx.state.usage.total_cost_usd is not None:
-            request_cost = response.cost_or_none()
-            if request_cost is None:
-                ctx.state.usage.total_cost_usd = None
-            else:
-                ctx.state.usage.total_cost_usd += request_cost
         if ctx.deps.usage_limits:  # pragma: no branch
+            if ctx.deps.usage_limits.cost_limit_usd is not None and ctx.state.usage.total_cost_usd is not None:
+                request_cost = response.cost_or_none()
+                if request_cost is None:
+                    ctx.state.usage.total_cost_usd = None
+                else:
+                    ctx.state.usage.total_cost_usd += request_cost
             ctx.deps.usage_limits.check_tokens(ctx.state.usage)
             ctx.deps.usage_limits.check_cost(ctx.state.usage)
         ctx.state.message_history.append(response)

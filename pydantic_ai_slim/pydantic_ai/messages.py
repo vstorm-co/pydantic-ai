@@ -1921,8 +1921,6 @@ class ModelResponse:
             return Decimal(0)
         if not self.model_name:
             return None
-        if self.provider_name == 'test' or self.model_name == 'test' or self.model_name.startswith('function:'):
-            return Decimal(0)
         try:
             return self.cost().total_price
         except (LookupError, ValueError):
