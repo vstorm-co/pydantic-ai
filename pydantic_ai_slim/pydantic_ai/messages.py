@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
 from datetime import datetime
+from decimal import Decimal
 from mimetypes import MimeTypes
 from os import PathLike
 from pathlib import Path
@@ -1913,6 +1914,17 @@ class ModelResponse:
             provider_id=self.provider_name,
             genai_request_timestamp=self.timestamp,
         )
+
+    def cost_or_none(self) -> Decimal | None:
+        """Return the total cost in USD, or `None` if pricing data is unavailable."""
+        if not self.usage.has_values():
+            return Decimal(0)
+        if not self.model_name:
+            return None
+        try:
+            return self.cost().total_price
+        except (LookupError, ValueError):
+            return None
 
     def otel_events(self, settings: InstrumentationSettings) -> list[LogRecord]:
         """Return OpenTelemetry events for the response."""

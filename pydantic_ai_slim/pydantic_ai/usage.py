@@ -3,6 +3,7 @@ from __future__ import annotations as _annotations
 import dataclasses
 from copy import copy
 from dataclasses import dataclass, fields
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any
 
 from genai_prices.data_snapshot import get_snapshot
@@ -209,6 +210,9 @@ class RunUsage(UsageBase):
     output_tokens: int = 0
     """Total number of output/completion tokens."""
 
+    total_cost_usd: Decimal | None = Decimal(0)
+    """Cumulative cost in USD, or `None` if any request was unpriced."""
+
     details: dict[str, int] = dataclasses.field(default_factory=dict[str, int])
     """Any extra details returned by the model."""
 
@@ -221,6 +225,10 @@ class RunUsage(UsageBase):
         if isinstance(incr_usage, RunUsage):
             self.requests += incr_usage.requests
             self.tool_calls += incr_usage.tool_calls
+            if incr_usage.total_cost_usd is None:
+                self.total_cost_usd = None
+            elif self.total_cost_usd is not None:
+                self.total_cost_usd += incr_usage.total_cost_usd
         return _incr_usage_tokens(self, incr_usage)
 
     def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
@@ -279,6 +287,8 @@ class UsageLimits:
     """The maximum number of output/response tokens allowed."""
     total_tokens_limit: int | None = None
     """The maximum number of tokens allowed in requests and responses combined."""
+    cost_limit_usd: Decimal | None = None
+    """Maximum total cost in USD allowed during the run (accepts `int`/`str`/`Decimal`, rejects `float`)."""
     count_tokens_before_request: bool = False
     """If True, perform a token counting pass before sending the request to the model,
     to enforce `request_tokens_limit` ahead of time.
@@ -313,6 +323,7 @@ class UsageLimits:
         input_tokens_limit: int | None = None,
         output_tokens_limit: int | None = None,
         total_tokens_limit: int | None = None,
+        cost_limit_usd: Decimal | int | str | None = None,
         count_tokens_before_request: bool = False,
     ) -> None:
         self.request_limit = request_limit
@@ -320,6 +331,7 @@ class UsageLimits:
         self.input_tokens_limit = input_tokens_limit
         self.output_tokens_limit = output_tokens_limit
         self.total_tokens_limit = total_tokens_limit
+        self.cost_limit_usd = coerce_decimal_usd(cost_limit_usd, 'cost_limit_usd')
         self.count_tokens_before_request = count_tokens_before_request
 
     @overload
@@ -334,6 +346,7 @@ class UsageLimits:
         request_tokens_limit: int | None = None,
         response_tokens_limit: int | None = None,
         total_tokens_limit: int | None = None,
+        cost_limit_usd: Decimal | int | str | None = None,
         count_tokens_before_request: bool = False,
     ) -> None:
         self.request_limit = request_limit
@@ -341,6 +354,7 @@ class UsageLimits:
         self.input_tokens_limit = request_tokens_limit
         self.output_tokens_limit = response_tokens_limit
         self.total_tokens_limit = total_tokens_limit
+        self.cost_limit_usd = coerce_decimal_usd(cost_limit_usd, 'cost_limit_usd')
         self.count_tokens_before_request = count_tokens_before_request
 
     def __init__(
@@ -351,6 +365,7 @@ class UsageLimits:
         input_tokens_limit: int | None = None,
         output_tokens_limit: int | None = None,
         total_tokens_limit: int | None = None,
+        cost_limit_usd: Decimal | int | str | None = None,
         count_tokens_before_request: bool = False,
         # deprecated:
         request_tokens_limit: int | None = None,
@@ -361,6 +376,7 @@ class UsageLimits:
         self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
         self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
         self.total_tokens_limit = total_tokens_limit
+        self.cost_limit_usd = coerce_decimal_usd(cost_limit_usd, 'cost_limit_usd')
         self.count_tokens_before_request = count_tokens_before_request
 
     def has_token_limits(self) -> bool:
@@ -380,6 +396,16 @@ class UsageLimits:
         request_limit = self.request_limit
         if request_limit is not None and usage.requests >= request_limit:
             raise UsageLimitExceeded(f'The next request would exceed the request_limit of {request_limit}')
+
+        if (
+            self.cost_limit_usd is not None
+            and usage.total_cost_usd is not None
+            and usage.total_cost_usd >= self.cost_limit_usd
+        ):
+            raise UsageLimitExceeded(
+                f'The next request would exceed the cost_limit_usd of {self.cost_limit_usd} '
+                f'(total_cost_usd={usage.total_cost_usd})'
+            )
 
         input_tokens = usage.input_tokens
         if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
@@ -418,4 +444,30 @@ class UsageLimits:
                 f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
             )
 
+    def check_cost(self, usage: RunUsage) -> None:
+        """Raise `UsageLimitExceeded` if accumulated cost exceeds `cost_limit_usd` (no-op if unset or poisoned)."""
+        if self.cost_limit_usd is None or usage.total_cost_usd is None:
+            return
+        if usage.total_cost_usd > self.cost_limit_usd:
+            raise UsageLimitExceeded(
+                f'Exceeded the cost_limit_usd of {self.cost_limit_usd} (total_cost_usd={usage.total_cost_usd})'
+            )
+
     __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+def coerce_decimal_usd(value: Decimal | int | str | None, field_name: str) -> Decimal | None:
+    """Normalise a USD value to `Decimal`, rejecting `float` to avoid binary-float precision errors."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool) or isinstance(value, float):
+        raise TypeError(
+            f'{field_name} does not accept {type(value).__name__} (got {value!r}) — '
+            'pass an int, str, or Decimal to keep arithmetic exact'
+        )
+    try:
+        return Decimal(value)
+    except InvalidOperation as e:
+        raise ValueError(f'{field_name} could not be parsed as a decimal number (got {value!r})') from e

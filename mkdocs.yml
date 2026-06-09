@@ -55,6 +55,7 @@ nav:
           - input.md
           - thinking.md
           - retries.md
+          - Budget Tracking: budget.md
       - MCP:
           - Overview: mcp/overview.md
           - mcp/client.md
@@ -149,6 +150,7 @@ nav:
       - pydantic_ai:
           - api/ag_ui.md
           - api/agent.md
+          - api/budget.md
           - api/builtin_tools.md
           - api/capabilities.md
           - api/common_tools.md
@@ -392,6 +394,7 @@ plugins:
           - a2a.md
           - agent.md
           - agent-spec.md
+          - budget.md
           - builtin-tools.md
           - capabilities.md
           - dependencies.md
