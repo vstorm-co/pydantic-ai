@@ -94,6 +94,64 @@ class MyRedisBudgetStore:
 
 `BudgetGuard` always passes timezone-aware UTC datetimes; if your store persists them, store them as UTC so window comparisons stay correct across hosts.
 
+## Pulling authoritative cost from the provider
+
+By default `BudgetGuard` **self-tracks** spend: it prices each response locally via [genai-prices][pydantic_ai.messages.ModelResponse.cost] and records it in the store. This is real-time and works for every provider, but it is an estimate — it can drift from the provider's actual invoice (rounding, discounts, pricing the local data doesn't know about).
+
+Anthropic and OpenAI additionally expose **admin cost APIs** that report authoritative, invoice-accurate spend. Pydantic AI can read these through a [`ProviderCostSource`][pydantic_ai.budget.ProviderCostSource], wrap it in a read-only [`ProviderBudgetStore`][pydantic_ai.budget.ProviderBudgetStore], and combine it with real-time self-tracking via [`CompositeBudgetStore`][pydantic_ai.budget.CompositeBudgetStore].
+
+!!! warning "Admin keys"
+    The cost APIs require an **organization-level admin key** (`ANTHROPIC_ADMIN_API_KEY` / `OPENAI_ADMIN_KEY`), which is far more privileged than a normal model API key. Provision it deliberately and scope it to the budgeting process. A missing key raises [`UserError`][pydantic_ai.exceptions.UserError].
+
+The recommended setup is the **hybrid** [`CompositeBudgetStore`][pydantic_ai.budget.CompositeBudgetStore]: a self-tracking store gates spend the instant it happens, while the provider store corrects the total toward the invoice on a TTL. If the admin API is unavailable, it degrades to pure self-tracking without erroring.
+
+```python {title="composite_budget.py" test="skip"}
+from pydantic_ai import Agent
+from pydantic_ai.budget import (
+    BudgetGuard,
+    CompositeBudgetStore,
+    OpenAICostSource,
+    ProviderBudgetStore,
+    SQLiteBudgetStore,
+)
+
+store = CompositeBudgetStore(
+    primary=SQLiteBudgetStore(),  # real-time guard: sees every request immediately
+    authoritative=ProviderBudgetStore(OpenAICostSource()),  # invoice-accurate, refreshed per TTL
+)
+
+agent = Agent(
+    'openai:gpt-5.2',
+    capabilities=[
+        BudgetGuard(
+            limit_usd=1000,
+            store=store,
+            key_fn=lambda ctx: ctx.deps.api_key_id,  # must match the provider's grouping dimension
+        ),
+    ],
+)
+```
+
+[`ProviderBudgetStore`][pydantic_ai.budget.ProviderBudgetStore] caches each authoritative read per key for `cache_ttl_seconds` (default 60s), because `get_spend` runs before every request and the admin APIs are rate-limited. You can also use it on its own (without the composite) if an estimate-free, slightly-delayed total is acceptable.
+
+### Provider differences
+
+| | [`AnthropicAdminCostSource`][pydantic_ai.budget.AnthropicAdminCostSource] | [`OpenAICostSource`][pydantic_ai.budget.OpenAICostSource] |
+|---|---|---|
+| Endpoint | `GET /v1/organizations/cost_report` | `GET /v1/organization/costs` |
+| Admin key | `ANTHROPIC_ADMIN_API_KEY` | `OPENAI_ADMIN_KEY` |
+| Grouping dimension (`key_fn` must return this) | `workspace_id` | `api_key_id` |
+| Amount unit (normalised to USD internally) | cents | USD |
+
+The `key_fn` you pass to `BudgetGuard` must return a value matching the provider's grouping dimension. For **OpenAI**, give each tenant a distinct API key and key budgets by `api_key_id` — per-tenant attribution works directly. For **Anthropic**, the cost report only groups by `workspace_id`, so per-tenant attribution requires a **separate Anthropic workspace per tenant**.
+
+!!! note "Day-granular cost"
+    Both cost APIs bucket by whole UTC days, so the authoritative figure is day-granular regardless of `window_hours`. The hybrid store's real-time `primary` covers the gap between the last billed day boundary and now, but exact rolling-window enforcement against the invoice is not possible — the same overshoot trade-off as self-tracking applies.
+
+### Other providers
+
+Only Anthropic and OpenAI expose a usable cost API, so they are the only adapters shipped. Every other provider keeps using self-tracking ([`SQLiteBudgetStore`][pydantic_ai.budget.SQLiteBudgetStore] / [`InMemoryBudgetStore`][pydantic_ai.budget.InMemoryBudgetStore]) with no changes — gateways, Bedrock, Vertex, and OpenRouter included. To integrate any other authoritative source, implement the [`ProviderCostSource`][pydantic_ai.budget.ProviderCostSource] protocol (a single `get_cost` method returning USD) and wrap it the same way.
+
 ## Combining with `UsageLimits.cost_limit_usd`
 
 `BudgetGuard` and [`UsageLimits.cost_limit_usd`](agent.md#capping-cost-in-usd) solve different problems and are designed to work together as **defense in depth**:

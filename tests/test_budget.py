@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 from pydantic_ai import Agent, UsageLimitExceeded
-from pydantic_ai.budget import DEFAULT_BUDGET_DB_PATH, BudgetGuard, InMemoryBudgetStore, SQLiteBudgetStore
+from pydantic_ai.budget import (
+    DEFAULT_BUDGET_DB_PATH,
+    AnthropicAdminCostSource,
+    BudgetGuard,
+    CompositeBudgetStore,
+    InMemoryBudgetStore,
+    OpenAICostSource,
+    ProviderBudgetStore,
+    ProviderCostSource,
+    SQLiteBudgetStore,
+)
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
@@ -332,3 +346,334 @@ async def test_sqlite_store_treats_naive_datetimes_as_utc(tmp_path: Path) -> Non
     await store.add_spend('default', Decimal('3'), naive)
 
     assert await store.get_spend('default', aware - timedelta(hours=1)) == Decimal('3')
+
+
+# --- Provider cost sources -------------------------------------------------------------------------
+
+
+def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    """An httpx client whose transport is driven by `handler` — no network, real httpx parsing."""
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_anthropic_cost_source_sums_and_normalizes_to_usd() -> None:
+    """Anthropic `amount` is in cents and is filtered to the requested workspace."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                'data': [
+                    {'results': [{'amount': '1000', 'workspace_id': 'wrk_a'}]},
+                    {
+                        'results': [
+                            {'amount': '500', 'workspace_id': 'wrk_a'},
+                            {'amount': '9999', 'workspace_id': 'wrk_b'},
+                        ]
+                    },
+                ],
+                'has_more': False,
+                'next_page': None,
+            },
+        )
+
+    async with _mock_client(handler) as client:
+        source = AnthropicAdminCostSource(api_key='admin-key', http_client=client)
+        cost = await source.get_cost(group_key='wrk_a', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost == Decimal('15')
+    assert captured[0].headers['x-api-key'] == 'admin-key'
+    assert captured[0].headers['anthropic-version'] == '2023-06-01'
+    assert captured[0].url.params['group_by[]'] == 'workspace_id'
+    assert captured[0].url.params['bucket_width'] == '1d'
+
+
+async def test_openai_cost_source_sums_dollar_amounts() -> None:
+    """OpenAI `amount.value` is already USD and is filtered to the requested api key."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                'object': 'page',
+                'data': [
+                    {
+                        'object': 'bucket',
+                        'results': [
+                            {'amount': {'value': 0.06, 'currency': 'usd'}, 'api_key_id': 'key_a'},
+                            {'amount': {'value': 1.5, 'currency': 'usd'}, 'api_key_id': 'key_b'},
+                        ],
+                    }
+                ],
+                'has_more': False,
+                'next_page': None,
+            },
+        )
+
+    async with _mock_client(handler) as client:
+        source = OpenAICostSource(api_key='admin-key', http_client=client)
+        cost = await source.get_cost(group_key='key_a', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost == Decimal('0.06')
+    assert captured[0].headers['authorization'] == 'Bearer admin-key'
+    assert captured[0].url.params['group_by[]'] == 'api_key_id'
+
+
+async def test_openai_cost_source_follows_pagination() -> None:
+    """`has_more=true` triggers a follow-up request carrying the `next_page` cursor."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if 'page' not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    'data': [{'results': [{'amount': {'value': 1.0, 'currency': 'usd'}, 'api_key_id': 'k'}]}],
+                    'has_more': True,
+                    'next_page': 'cursor-2',
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                'data': [{'results': [{'amount': {'value': 2.0, 'currency': 'usd'}, 'api_key_id': 'k'}]}],
+                'has_more': False,
+                'next_page': None,
+            },
+        )
+
+    async with _mock_client(handler) as client:
+        source = OpenAICostSource(api_key='admin-key', http_client=client)
+        cost = await source.get_cost(group_key='k', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost == Decimal('3')
+    assert len(captured) == 2
+    assert captured[1].url.params['page'] == 'cursor-2'
+
+
+async def test_cost_source_returns_none_on_http_error() -> None:
+    """A non-2xx response is poison: the source cannot determine spend, so it returns `None`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={'error': 'boom'})
+
+    async with _mock_client(handler) as client:
+        source = OpenAICostSource(api_key='admin-key', http_client=client)
+        cost = await source.get_cost(group_key='k', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost is None
+
+
+async def test_cost_source_returns_zero_when_group_absent() -> None:
+    """A successful response with no rows for the group means zero spend, not poison."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={'data': [{'results': [{'amount': {'value': 5.0, 'currency': 'usd'}, 'api_key_id': 'other'}]}]},
+        )
+
+    async with _mock_client(handler) as client:
+        source = OpenAICostSource(api_key='admin-key', http_client=client)
+        cost = await source.get_cost(group_key='mine', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost == Decimal('0')
+
+
+async def test_cost_source_creates_and_closes_its_own_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no `http_client`, the source creates one and closes it after the read."""
+    created: list[httpx.AsyncClient] = []
+
+    def fake_create_async_http_client(**_kwargs: Any) -> httpx.AsyncClient:
+        client = _mock_client(
+            lambda _request: httpx.Response(
+                200,
+                json={'data': [{'results': [{'amount': '4200', 'workspace_id': 'wrk'}]}]},
+            )
+        )
+        created.append(client)
+        return client
+
+    monkeypatch.setattr('pydantic_ai.models.create_async_http_client', fake_create_async_http_client)
+
+    source = AnthropicAdminCostSource(api_key='admin-key')
+    cost = await source.get_cost(group_key='wrk', since=_utcnow() - timedelta(hours=1), until=_utcnow())
+
+    assert cost == Decimal('42')
+    assert created and created[0].is_closed
+
+
+def test_anthropic_cost_source_requires_admin_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ANTHROPIC_ADMIN_API_KEY', raising=False)
+    with pytest.raises(UserError, match='ANTHROPIC_ADMIN_API_KEY'):
+        AnthropicAdminCostSource()
+
+
+def test_openai_cost_source_requires_admin_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('OPENAI_ADMIN_KEY', raising=False)
+    with pytest.raises(UserError, match='OPENAI_ADMIN_KEY'):
+        OpenAICostSource()
+
+
+def test_cost_sources_read_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both adapters fall back to their documented environment variables."""
+    monkeypatch.setenv('ANTHROPIC_ADMIN_API_KEY', 'anthropic-env')
+    monkeypatch.setenv('OPENAI_ADMIN_KEY', 'openai-env')
+
+    assert isinstance(AnthropicAdminCostSource(), AnthropicAdminCostSource)
+    assert isinstance(OpenAICostSource(), OpenAICostSource)
+
+
+# --- ProviderBudgetStore ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CountingCostSource:
+    """A fake `ProviderCostSource` that records how often it is queried."""
+
+    value: Decimal | None
+    calls: int = 0
+
+    async def get_cost(self, *, group_key: str, since: datetime, until: datetime) -> Decimal | None:
+        self.calls += 1
+        return self.value
+
+
+def test_counting_cost_source_satisfies_protocol() -> None:
+    assert isinstance(_CountingCostSource(Decimal('1')), ProviderCostSource)
+
+
+async def test_provider_budget_store_caches_within_ttl() -> None:
+    """A second read inside the TTL window is served from cache without re-querying the source."""
+    source = _CountingCostSource(Decimal('7'))
+    store = ProviderBudgetStore(source, cache_ttl_seconds=60)
+    since = _utcnow() - timedelta(hours=1)
+
+    assert await store.get_spend('k', since) == Decimal('7')
+    assert await store.get_spend('k', since) == Decimal('7')
+    assert source.calls == 1
+
+
+async def test_provider_budget_store_refetches_after_ttl_expiry() -> None:
+    """With a zero TTL every read re-queries the source."""
+    source = _CountingCostSource(Decimal('7'))
+    store = ProviderBudgetStore(source, cache_ttl_seconds=0)
+    since = _utcnow() - timedelta(hours=1)
+
+    await store.get_spend('k', since)
+    await store.get_spend('k', since)
+    assert source.calls == 2
+
+
+async def test_provider_budget_store_caches_none() -> None:
+    """A `None` (poison) result is cached just like a numeric one."""
+    source = _CountingCostSource(None)
+    store = ProviderBudgetStore(source, cache_ttl_seconds=60)
+    since = _utcnow() - timedelta(hours=1)
+
+    assert await store.get_spend('k', since) is None
+    assert await store.get_spend('k', since) is None
+    assert source.calls == 1
+
+
+async def test_provider_budget_store_add_spend_is_noop() -> None:
+    """The provider is the source of truth, so writes are dropped."""
+    source = _CountingCostSource(Decimal('1'))
+    store = ProviderBudgetStore(source)
+
+    assert await store.add_spend('k', Decimal('5'), _utcnow()) is None
+
+
+# --- CompositeBudgetStore --------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeStore:
+    """A fake `BudgetStore` with a fixed `get_spend` and a record of `add_spend` calls."""
+
+    value: Decimal | None
+    added: list[tuple[str, Decimal | None, datetime]] = field(
+        default_factory=list['tuple[str, Decimal | None, datetime]']
+    )
+
+    async def get_spend(self, key: str, since: datetime) -> Decimal | None:
+        return self.value
+
+    async def add_spend(self, key: str, amount: Decimal | None, when: datetime) -> None:
+        self.added.append((key, amount, when))
+
+
+async def test_composite_adds_live_self_tracking_to_authoritative_base() -> None:
+    """Total = authoritative base + self-tracked spend recorded since the base last moved."""
+    primary = InMemoryBudgetStore()
+    authoritative = _FakeStore(Decimal('10'))
+    composite = CompositeBudgetStore(primary=primary, authoritative=authoritative)
+    since = _utcnow() - timedelta(hours=1)
+
+    assert await composite.get_spend('k', since) == Decimal('10')
+
+    await composite.add_spend('k', Decimal('2'), _utcnow())
+    assert await composite.get_spend('k', since) == Decimal('12')
+
+
+async def test_composite_resets_live_window_when_authoritative_moves() -> None:
+    """When the billed figure catches up, previously-live spend folds into the new base."""
+    primary = InMemoryBudgetStore()
+    authoritative = _FakeStore(Decimal('10'))
+    composite = CompositeBudgetStore(primary=primary, authoritative=authoritative)
+    since = _utcnow() - timedelta(hours=1)
+
+    await composite.get_spend('k', since)
+    await composite.add_spend('k', Decimal('5'), _utcnow())
+
+    authoritative.value = Decimal('20')
+    assert await composite.get_spend('k', since) == Decimal('20')
+
+
+async def test_composite_falls_back_to_primary_when_authoritative_unavailable() -> None:
+    """A `None` authoritative read degrades to pure self-tracking instead of erroring."""
+    primary = _FakeStore(Decimal('3'))
+    authoritative = _FakeStore(None)
+    composite = CompositeBudgetStore(primary=primary, authoritative=authoritative)
+
+    assert await composite.get_spend('k', _utcnow() - timedelta(hours=1)) == Decimal('3')
+
+
+async def test_composite_propagates_live_poison() -> None:
+    """An unpriced live event poisons the total even when the base is known."""
+    primary = _FakeStore(None)
+    authoritative = _FakeStore(Decimal('10'))
+    composite = CompositeBudgetStore(primary=primary, authoritative=authoritative)
+
+    assert await composite.get_spend('k', _utcnow() - timedelta(hours=1)) is None
+
+
+async def test_composite_add_spend_only_reaches_primary() -> None:
+    """Writes go to the real-time `primary`; the authoritative store stays read-only."""
+    primary = _FakeStore(Decimal('0'))
+    authoritative = _FakeStore(Decimal('0'))
+    composite = CompositeBudgetStore(primary=primary, authoritative=authoritative)
+
+    when = _utcnow()
+    await composite.add_spend('k', Decimal('1'), when)
+
+    assert primary.added == [('k', Decimal('1'), when)]
+    assert authoritative.added == []
+
+
+async def test_budget_guard_blocks_on_live_spend_before_provider_sees_it() -> None:
+    """Hybrid mode: `primary` self-tracking blocks in real time while the provider still reports zero."""
+    source = _CountingCostSource(Decimal('0'))  # provider hasn't billed anything yet
+    composite = CompositeBudgetStore(primary=InMemoryBudgetStore(), authoritative=ProviderBudgetStore(source))
+    guard = BudgetGuard(limit_usd=Decimal('1.50'), store=composite)
+    agent = Agent(FunctionModel(_ok_response, model_name='gpt-4o'), capabilities=[guard])
+
+    await agent.run('first')
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('BudgetGuard limit_usd=1.50 exceeded')):
+        await agent.run('second')
